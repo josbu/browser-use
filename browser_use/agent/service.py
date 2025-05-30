@@ -5,10 +5,12 @@ import json
 import logging
 import os
 import re
+import shutil
 import sys
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from threading import Thread
 from typing import Any, Generic, TypeVar
 
 from dotenv import load_dotenv
@@ -144,6 +146,9 @@ class Agent(Generic[Context]):
 			'alt',
 			'aria-expanded',
 			'data-date-format',
+			'checked',
+			'data-state',
+			'aria-checked',
 		],
 		max_actions_per_step: int = 10,
 		tool_calling_method: ToolCallingMethod | None = 'auto',
@@ -291,12 +296,22 @@ class Agent(Generic[Context]):
 		# assert not (browser and browser_context), 'Cannot provide both browser and browser_context'
 		# assert not (browser_session and browser_context), 'Cannot provide both browser_session and browser_context'
 		browser_profile = browser_profile or DEFAULT_BROWSER_PROFILE
-		self.browser_session = browser_session or BrowserSession(
-			profile=browser_profile,
-			browser=browser,
-			browser_context=browser_context,
-			page=page,
-		)
+
+		if browser_session:
+			# always copy sessions that are passed in to avoid conflicting with other agents sharing the same session
+			self.browser_session = browser_session.model_copy(
+				update={
+					'agent_current_page': None,
+					'human_current_page': None,
+				},
+			)
+		else:
+			self.browser_session = BrowserSession(
+				browser_profile=browser_profile,
+				browser=browser,
+				browser_context=browser_context,
+				page=page,
+			)
 
 		if self.sensitive_data:
 			# Check if sensitive_data has domain-specific credentials
@@ -581,7 +596,33 @@ class Agent(Generic[Context]):
 				return results
 
 			# Execute async tests
-			results = asyncio.run(test_all_methods())
+			try:
+				loop = asyncio.get_running_loop()
+				# Running loop: create a new loop in a separate thread
+				result = {}
+
+				def run_in_thread():
+					new_loop = asyncio.new_event_loop()
+					asyncio.set_event_loop(new_loop)
+					try:
+						result['value'] = new_loop.run_until_complete(test_all_methods())
+					except Exception as e:
+						result['error'] = e
+					finally:
+						new_loop.close()
+
+				t = Thread(target=run_in_thread)
+				t.start()
+				t.join()
+				if 'error' in result:
+					raise result['error']
+				results = result['value']
+
+			except RuntimeError as e:
+				if 'no running event loop' in str(e):
+					results = asyncio.run(test_all_methods())
+				else:
+					raise
 
 			# Process results in order of preference
 			for i, method in enumerate(methods_to_try):
@@ -615,6 +656,8 @@ class Agent(Generic[Context]):
 		# OpenAI models
 		if self.chat_model_library == 'ChatOpenAI':
 			if any(m in model_lower for m in ['gpt-4', 'gpt-3.5']):
+				return 'function_calling'
+			if any(m in model_lower for m in ['llama-4', 'llama-3']):
 				return 'function_calling'
 
 		# Azure OpenAI models
@@ -1169,12 +1212,23 @@ class Agent(Generic[Context]):
 		)
 		current_tokens = getattr(self._message_manager.state.history, 'current_tokens', 0)
 
-		# Determine output type
-		output_type = 'raw text output' if method == 'raw' else 'structured output + tools'
-		image_status = '📷 images' if has_images else 'no images'
+		# Count available tools/actions from the current ActionModel
+		# This gives us the actual number of tools exposed to the LLM for this specific call
+		tool_count = len(self.ActionModel.model_fields) if hasattr(self, 'ActionModel') else 0
 
+		# Format the log message parts
+		image_status = ', 📷 img' if has_images else ''
+		if method == 'raw':
+			output_format = '=> raw text'
+			tool_info = ''
+		else:
+			output_format = '=> JSON out'
+			tool_info = f' + 🔨 {tool_count} tools ({method})'
+
+		term_width = shutil.get_terminal_size((80, 20)).columns
+		print('=' * term_width)
 		logger.info(
-			f'🧠 LLM call: {self.chat_model_library} ({method}) | {message_count} msgs, ~{current_tokens} tokens, {total_chars} chars | {image_status} | {output_type}'
+			f'🧠 LLM call => {self.chat_model_library} [✉️ {message_count} msg, ~{current_tokens} tk, {total_chars} char{image_status}] {output_format}{tool_info}'
 		)
 
 	def _log_agent_event(self, max_steps: int, agent_run_error: str | None = None) -> None:
@@ -1593,7 +1647,7 @@ class Agent(Generic[Context]):
 
 	async def _execute_history_step(self, history_item: AgentHistory, delay: float) -> list[ActionResult]:
 		"""Execute a single step from history with element validation"""
-		state = await self.browser_context.get_state_summary(cache_clickable_elements_hashes=False)
+		state = await self.browser_session.get_state_summary(cache_clickable_elements_hashes=False)
 		if not state or not history_item.model_output:
 			raise ValueError('Invalid state or model output')
 		updated_actions = []
@@ -1737,7 +1791,7 @@ class Agent(Generic[Context]):
 			return None
 
 		# Get current state to filter actions by page
-		page = await self.browser_context.get_current_page()
+		page = await self.browser_session.get_current_page()
 
 		# Get all standard actions (no filter) and page-specific actions
 		standard_actions = self.controller.registry.get_prompt_description()  # No page = system prompt actions

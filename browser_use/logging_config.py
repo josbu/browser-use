@@ -1,7 +1,6 @@
 import logging
 import os
 import sys
-import warnings
 
 from dotenv import load_dotenv
 
@@ -60,12 +59,6 @@ def addLoggingLevel(levelName, levelNum, methodName=None):
 
 
 def setup_logging():
-	# Suppress specific deprecation warnings from FAISS
-	warnings.filterwarnings('ignore', category=DeprecationWarning, module='faiss.loader')
-	warnings.filterwarnings('ignore', message='builtin type SwigPyPacked has no __module__ attribute')
-	warnings.filterwarnings('ignore', message='builtin type SwigPyObject has no __module__ attribute')
-	warnings.filterwarnings('ignore', message='builtin type swigvarlink has no __module__ attribute')
-
 	# Try to add RESULT level, but ignore if it already exists
 	try:
 		addLoggingLevel('RESULT', 35)  # This allows ERROR, FATAL and CRITICAL
@@ -84,8 +77,8 @@ def setup_logging():
 
 	class BrowserUseFormatter(logging.Formatter):
 		def format(self, record):
-			if isinstance(record.name, str) and record.name.startswith('browser_use.'):
-				record.name = record.name.split('.')[-2]
+			# if isinstance(record.name, str) and record.name.startswith('browser_use.'):
+			# 	record.name = record.name.split('.')[-2]
 			return super().format(record)
 
 	# Setup single handler for all loggers
@@ -144,3 +137,5 @@ def setup_logging():
 		third_party = logging.getLogger(logger_name)
 		third_party.setLevel(logging.ERROR)
 		third_party.propagate = False
+
+	return logger
